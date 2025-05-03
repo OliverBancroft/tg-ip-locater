@@ -5,6 +5,9 @@ on:
     tags:
       - "v*" # 当推送以v开头的标签时触发，如v1.0.0
 
+permissions:
+  contents: write # 这一行很重要，授予写入仓库内容的权限
+
 jobs:
   build:
     runs-on: ubuntu-latest
