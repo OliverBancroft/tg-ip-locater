@@ -1,0 +1,291 @@
+name: Build and Release for Debian 12
+
+on:
+  push:
+    tags:
+      - "v*" # 当推送以v开头的标签时触发，如v1.0.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0 # 获取所有标签
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.21"
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v2
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "VERSION_NUMBER=${VERSION#v}" >> $GITHUB_ENV
+
+      - name: Create Debian 12 build environment
+        run: |
+          cat > Dockerfile.debian12 << 'EOL'
+          FROM debian:12-slim
+
+          # 安装必要的依赖
+          RUN apt-get update && apt-get install -y \
+              build-essential \
+              curl \
+              git \
+              traceroute \
+              iputils-ping \
+              wget \
+              ca-certificates \
+              && rm -rf /var/lib/apt/lists/*
+
+          # 安装 Go 1.21
+          RUN curl -sSL https://golang.org/dl/go1.21.4.linux-amd64.tar.gz | tar -C /usr/local -xz
+          ENV PATH="/usr/local/go/bin:${PATH}"
+          ENV GOPATH="/go"
+
+          WORKDIR /build
+          EOL
+
+          docker build -t telegram-latency-builder:debian12 -f Dockerfile.debian12 .
+
+      - name: Build for Debian 12
+        run: |
+          mkdir -p build
+
+          # 在Docker容器中构建
+          docker run --rm -v $(pwd):/build telegram-latency-builder:debian12 bash -c '
+            # 设置Go模块
+            go mod tidy
+            
+            # 构建可执行文件
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-X main.Version=${{ env.VERSION_NUMBER }} -s -w" -o telegram-latency-server cmd/server/main.go
+            
+            # 确保正确的权限
+            chmod +x telegram-latency-server
+          '
+
+          # 创建归档文件
+          tar -czvf telegram-latency-server-debian12-amd64.tar.gz telegram-latency-server
+
+          # 创建 checksums
+          sha256sum telegram-latency-server-debian12-amd64.tar.gz > telegram-latency-server-debian12-amd64.tar.gz.sha256
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            telegram-latency-server-debian12-amd64.tar.gz
+            telegram-latency-server-debian12-amd64.tar.gz.sha256
+          name: Release ${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create systemd service file
+        run: |
+          cat > telegram-latency.service << 'EOL'
+          [Unit]
+          Description=Telegram Latency Measurement Server
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=root
+          ExecStart=/usr/local/bin/telegram-latency-server
+          Restart=on-failure
+          RestartSec=5
+          Environment=SERVER_LOCATION=XX
+          Environment=PORT=8080
+
+          [Install]
+          WantedBy=multi-user.target
+          EOL
+
+          # 添加到发布文件
+          github_curl() {
+            curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$@"
+          }
+
+          # 获取上传URL
+          UPLOAD_URL=$(github_curl "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.VERSION }}" | jq -r .upload_url | sed 's/{?name,label}//')
+
+          # 上传服务文件
+          github_curl -X POST "${UPLOAD_URL}?name=telegram-latency.service" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @telegram-latency.service
+
+      - name: Create installation script
+        run: |
+          cat > install.sh << 'EOL'
+          #!/bin/bash
+
+          # 安装脚本 for Telegram Latency Server
+
+          # 检查是否以root运行
+          if [ "$EUID" -ne 0 ]; then
+            echo "请以root权限运行此脚本"
+            exit 1
+          fi
+
+          # 检查并安装依赖
+          echo "检查并安装依赖..."
+          apt-get update
+          apt-get install -y traceroute iputils-ping curl
+
+          # 创建安装目录
+          INSTALL_DIR="/usr/local/bin"
+          echo "创建安装目录: $INSTALL_DIR"
+          mkdir -p $INSTALL_DIR
+
+          # 下载最新版本
+          VERSION="${1:-v1.0.0}"  # 使用提供的版本或默认为v1.0.0
+          DOWNLOAD_URL="https://github.com/ACCOUNT/PROJECT/releases/download/$VERSION/telegram-latency-server-debian12-amd64.tar.gz"
+
+          echo "下载版本 $VERSION..."
+          curl -L $DOWNLOAD_URL -o /tmp/telegram-latency-server.tar.gz
+
+          # 解压文件
+          echo "解压文件..."
+          tar -xzf /tmp/telegram-latency-server.tar.gz -C /tmp
+
+          # 安装可执行文件
+          echo "安装到 $INSTALL_DIR..."
+          cp /tmp/telegram-latency-server $INSTALL_DIR/
+          chmod +x $INSTALL_DIR/telegram-latency-server
+
+          # 安装系统服务
+          echo "安装系统服务..."
+          curl -L "https://github.com/ACCOUNT/PROJECT/releases/download/$VERSION/telegram-latency.service" -o /etc/systemd/system/telegram-latency.service
+
+          # 设置服务器位置
+          read -p "请输入服务器位置 (US, SG, EU): " SERVER_LOCATION
+          sed -i "s/Environment=SERVER_LOCATION=XX/Environment=SERVER_LOCATION=$SERVER_LOCATION/" /etc/systemd/system/telegram-latency.service
+
+          # 启用并启动服务
+          echo "启用并启动服务..."
+          systemctl daemon-reload
+          systemctl enable telegram-latency.service
+          systemctl start telegram-latency.service
+
+          # 完成
+          echo "安装完成!"
+          echo "服务状态:"
+          systemctl status telegram-latency.service
+
+          # 清理
+          echo "清理临时文件..."
+          rm -f /tmp/telegram-latency-server.tar.gz
+          rm -f /tmp/telegram-latency-server
+
+          echo "使用以下命令查看日志:"
+          echo "journalctl -u telegram-latency.service -f"
+          EOL
+
+          # 替换安装脚本中的仓库信息
+          sed -i "s|ACCOUNT/PROJECT|${{ github.repository }}|g" install.sh
+          chmod +x install.sh
+
+          # 上传安装脚本
+          github_curl() {
+            curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$@"
+          }
+
+          # 获取上传URL
+          UPLOAD_URL=$(github_curl "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.VERSION }}" | jq -r .upload_url | sed 's/{?name,label}//')
+
+          # 上传安装脚本
+          github_curl -X POST "${UPLOAD_URL}?name=install.sh" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @install.sh
+
+      - name: Update release description
+        run: |
+          cat > release_notes.md << 'EOL'
+          # Telegram Latency Server ${{ env.VERSION }}
+
+          这个版本包含以下文件:
+
+          - `telegram-latency-server-debian12-amd64.tar.gz`: Debian 12 x86_64 平台的可执行文件
+          - `telegram-latency-server-debian12-amd64.tar.gz.sha256`: SHA256 校验和
+          - `telegram-latency.service`: systemd 服务文件
+          - `install.sh`: 自动安装脚本
+
+          ## 快速安装
+
+          通过以下命令进行安装:
+
+          ```bash
+          # 下载安装脚本
+          curl -L "https://github.com/${{ github.repository }}/releases/download/${{ env.VERSION }}/install.sh" -o install.sh
+
+          # 给予执行权限
+          chmod +x install.sh
+
+          # 以root权限运行脚本
+          sudo ./install.sh ${{ env.VERSION }}
+          ```
+
+          ## 手动安装
+
+          1. 下载并解压可执行文件:
+          ```bash
+          curl -L "https://github.com/${{ github.repository }}/releases/download/${{ env.VERSION }}/telegram-latency-server-debian12-amd64.tar.gz" -o telegram-latency-server.tar.gz
+          tar -xzf telegram-latency-server.tar.gz
+          sudo mv telegram-latency-server /usr/local/bin/
+          sudo chmod +x /usr/local/bin/telegram-latency-server
+          ```
+
+          2. 下载并安装systemd服务:
+          ```bash
+          curl -L "https://github.com/${{ github.repository }}/releases/download/${{ env.VERSION }}/telegram-latency.service" -o telegram-latency.service
+          # 编辑服务文件，设置正确的SERVER_LOCATION (US, SG, 或 EU)
+          sudo mv telegram-latency.service /etc/systemd/system/
+          sudo systemctl daemon-reload
+          sudo systemctl enable telegram-latency.service
+          sudo systemctl start telegram-latency.service
+          ```
+
+          ## 验证安装
+
+          ```bash
+          # 检查服务状态
+          sudo systemctl status telegram-latency.service
+
+          # 检查日志
+          sudo journalctl -u telegram-latency.service -f
+
+          # 测试API
+          curl http://localhost:8080/health
+          ```
+          EOL
+
+          # 更新发布描述
+          github_curl() {
+            curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github.v3+json" \
+                "$@"
+          }
+
+          RELEASE_ID=$(github_curl "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ env.VERSION }}" | jq -r .id)
+
+          github_curl -X PATCH "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID" \
+            -d @- << EOF
+          {
+            "body": $(cat release_notes.md | jq -s -R .)
+          }
+          EOF
